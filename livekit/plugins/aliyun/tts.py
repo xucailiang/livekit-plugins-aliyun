@@ -31,6 +31,9 @@ class TTSOptions:
     sample_rate: int
     # 音调，取值范围：0.5~2。
     pitch: float = 1.0
+    # 是否启用分句，默认 True 保持向后兼容
+    # 设置为 False 可解决与 livekit-agents 框架的 segment 计数不匹配问题
+    sentence_split: bool = True
 
     def get_ws_url(self) -> str:
         return "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
@@ -108,6 +111,7 @@ class TTS(tts.TTS):
         pitch: float = 1.0,
         http_session: aiohttp.ClientSession | None = None,
         max_session_duration: float = 600,
+        sentence_split: bool = True,
     ) -> None:
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -127,6 +131,7 @@ class TTS(tts.TTS):
             sample_rate=sample_rate,
             rate=rate,
             pitch=pitch,
+            sentence_split=sentence_split,
         )
         self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
             connect_cb=self._connect_ws,
@@ -257,14 +262,25 @@ class SynthesizeStream(tts.SynthesizeStream):
                     logger.warning("WebSocket connection closed by server")
                     break
 
-        splitter = TextStreamSentencizer(remove_emoji=True)
+        splitter = TextStreamSentencizer(remove_emoji=True) if self._opts.sentence_split else None
+        collected_text = ""
         is_first_sentence = True
         start_time = time.perf_counter()
         async for token in self._input_ch:
-            if isinstance(token, self._FlushSentinel):
-                sentences = splitter.flush()
+            if self._opts.sentence_split:
+                # 启用分句：使用 TextStreamSentencizer 拆分句子
+                if isinstance(token, self._FlushSentinel):
+                    sentences = splitter.flush()
+                else:
+                    sentences = splitter.push(text=token)
             else:
-                sentences = splitter.push(text=token)
+                # 禁用分句：收集所有 token，flush 时作为整体处理
+                if isinstance(token, self._FlushSentinel):
+                    sentences = [collected_text] if collected_text.strip() else []
+                    collected_text = ""
+                else:
+                    collected_text += token
+                    sentences = []
             for sentence in sentences:
                 if is_first_sentence:
                     first_sentence_spend = time.perf_counter() - start_time

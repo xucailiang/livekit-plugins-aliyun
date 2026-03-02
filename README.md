@@ -149,6 +149,29 @@ stt = aliyun.STT(
 )
 ```
 
+### 解决 Segment Mismatch 问题
+
+在使用 livekit-agents 框架时，TTS 流式合成可能会报错：
+
+```
+APIError: number of segments mismatch: expected 1, but got N
+```
+
+这是因为默认情况下，TTS 会按标点符号将文本拆分成多个句子，每个句子产生一个独立的 segment。当框架期望的 segment 数量与实际产生的不匹配时，会抛出错误。
+
+通过设置 `sentence_split=False` 可以禁用分句功能，整段文本作为一个 segment 处理：
+
+```python
+from livekit.plugins import aliyun
+
+# 禁用分句，解决 segment mismatch 问题
+tts = aliyun.TTS(
+    model="cosyvoice-v2",
+    voice="longcheng_v2",
+    sentence_split=False  # 禁用分句，整段文本作为一个 segment
+)
+```
+
 ## 🔧 API 参考
 
 ### TTS (文本转语音)
@@ -159,7 +182,8 @@ aliyun.TTS(
     voice: str = "longcheng_v2",      # 语音类型
     speech_rate: float = 1.0,        # 语速 (0.5-2.0)
     pitch_rate: float = 1.0,         # 音调 (0.5-2.0)
-    volume: int = 50                 # 音量 (0-100)
+    volume: int = 50,                # 音量 (0-100)
+    sentence_split: bool = True      # 是否启用分句，设为 False 可解决 segment mismatch 问题
 )
 ```
 
@@ -183,4 +207,3 @@ aliyun.LLM(
     max_tokens: int = 2000           # 最大token数
 )
 ```
-# livekit-plugins-aliyun
