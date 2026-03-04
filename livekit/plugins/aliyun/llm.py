@@ -80,7 +80,7 @@ class LLM(llm.LLM):
             http_client=httpx.AsyncClient(
                 timeout=timeout
                 if timeout
-                else httpx.Timeout(connect=15.0, read=5.0, write=5.0, pool=5.0),
+                else httpx.Timeout(connect=15.0, read=60.0, write=5.0, pool=5.0),
                 follow_redirects=True,
                 limits=httpx.Limits(
                     max_connections=50,

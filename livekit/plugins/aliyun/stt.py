@@ -28,7 +28,6 @@ class STTOptions:
     language: str | None
     detect_language: bool
     interim_results: bool
-    punctuate: bool
     model: str
     max_sentence_silence: int = 500
     sample_rate: int = 16000
@@ -42,9 +41,9 @@ class STTOptions:
     disfluency_removal_enabled: bool = False
     # 设置是否开启语义断句，默认关闭。
     semantic_punctuation_enabled: bool = False
-    # 设置是否开启标点预测，默认关闭。
+    # 设置是否开启标点预测，默认开启。
     punctuation_prediction_enabled: bool = True
-    # 设置是否开启文本逆归一化，默认关闭。
+    # 设置是否开启文本逆归一化，默认开启。
     inverse_text_normalization_enabled: bool = True
 
     def get_ws_url(self):
@@ -60,6 +59,27 @@ class STTOptions:
         return header
 
     def get_run_task_params(self, task_id: str):
+        # 构建 parameters，只包含有效值
+        parameters = {
+            "format": "wav",
+            "sample_rate": self.sample_rate,
+            "disfluency_removal_enabled": self.disfluency_removal_enabled,
+            "semantic_punctuation_enabled": self.semantic_punctuation_enabled,
+            "punctuation_prediction_enabled": self.punctuation_prediction_enabled,
+            "inverse_text_normalization_enabled": self.inverse_text_normalization_enabled,
+            "max_sentence_silence": self.max_sentence_silence,
+            "heartbeat": True,
+            "diarization_enabled": True,
+        }
+        
+        # 只有当 vocabulary_id 有值时才添加
+        if self.vocabulary_id:
+            parameters["vocabulary_id"] = self.vocabulary_id
+        
+        # 只有当 language 有值时才添加 language_hints
+        if self.language:
+            parameters["language_hints"] = self.language.split(",")
+        
         params = {
             "header": {
                 "action": "run-task",
@@ -71,19 +91,7 @@ class STTOptions:
                 "task": "asr",
                 "function": "recognition",
                 "model": self.model,
-                "parameters": {
-                    "format": "wav",
-                    "sample_rate": self.sample_rate,
-                    "vocabulary_id": self.vocabulary_id,
-                    "disfluency_removal_enabled": self.disfluency_removal_enabled,
-                    "semantic_punctuation_enabled": self.semantic_punctuation_enabled,
-                    "punctuation_prediction_enabled": self.punctuation_prediction_enabled,
-                    "inverse_text_normalization_enabled": self.inverse_text_normalization_enabled,
-                    "max_sentence_silence": self.max_sentence_silence,
-                    "heartbeat": True,
-                    "diarization_enabled": True,
-                    "language_hints": self.language.split(","),
-                },
+                "parameters": parameters,
                 "input": {},
             },
         }
@@ -105,10 +113,9 @@ class STT(stt.STT):
     def __init__(
         self,
         *,
-        language="zh",
+        language: str = "zh",
         detect_language: bool = False,
         interim_results: bool = True,
-        punctuate: bool = True,
         model: str = "paraformer-realtime-v2",
         api_key: str | None = None,
         max_sentence_silence: int = 500,
@@ -133,7 +140,6 @@ class STT(stt.STT):
             language=language,
             detect_language=detect_language,
             interim_results=interim_results,
-            punctuate=punctuate,
             model=model,
             max_sentence_silence=max_sentence_silence,
             disfluency_removal_enabled=disfluency_removal_enabled,
@@ -176,6 +182,15 @@ class STT(stt.STT):
 
 
 class SpeechStream(stt.SpeechStream):
+    """
+    阿里云 STT 流式识别实现。
+
+    符合阿里云官方文档要求：
+    - task_id 在整个任务生命周期保持一致
+    - 等待 task-started 事件后才发送音频数据
+    - 正确处理 task-failed 事件
+    """
+
     def __init__(
         self,
         stt: STT,
@@ -194,6 +209,10 @@ class SpeechStream(stt.SpeechStream):
         self._request_id = utils.shortuuid()
         self._reconnect_event = asyncio.Event()
         self._session = http_session
+        # 任务状态事件（符合阿里云官方文档要求）
+        self._task_started = asyncio.Event()
+        self._task_failed = False
+        self._task_error: str | None = None
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         ws = await asyncio.wait_for(
@@ -212,6 +231,24 @@ class SpeechStream(stt.SpeechStream):
         @utils.log_exceptions(logger=logger)
         async def send_task(ws: aiohttp.ClientWebSocketResponse):
             nonlocal closing_ws
+            
+            # 等待 task-started 事件（阿里云官方文档要求）
+            # "You must wait to receive this event before you send the audio"
+            try:
+                await asyncio.wait_for(
+                    self._task_started.wait(),
+                    timeout=self._conn_options.timeout or 10.0
+                )
+            except asyncio.TimeoutError:
+                logger.error("Timeout waiting for task-started event")
+                return
+            
+            if self._task_failed:
+                logger.error(f"Task failed before sending audio: {self._task_error}")
+                return
+            
+            logger.debug("Received task-started, ready to send audio")
+            
             samples_100ms = self._opts.sample_rate // 10
             audio_bstream = utils.audio.AudioByteStream(
                 sample_rate=self._opts.sample_rate,
@@ -221,6 +258,11 @@ class SpeechStream(stt.SpeechStream):
 
             has_ended = False
             async for data in self._input_ch:
+                # 检查任务是否已失败
+                if self._task_failed:
+                    logger.warning("Task failed, stopping audio send")
+                    break
+                    
                 frames: list[rtc.AudioFrame] = []
                 if isinstance(data, rtc.AudioFrame):
                     frames.extend(audio_bstream.write(data.data.tobytes()))
@@ -268,16 +310,53 @@ class SpeechStream(stt.SpeechStream):
                     raise APIStatusError(message="connection closed unexpectedly")
 
                 try:
-                    self._process_stream_event(json.loads(msg.data))
+                    data = json.loads(msg.data)
+                    event_type = data.get("header", {}).get("event")
+                    
+                    # 处理 task-started 事件（阿里云官方文档要求）
+                    if event_type == "task-started":
+                        logger.info("STT task started")
+                        self._task_started.set()
+                        continue
+                    
+                    # 处理 task-failed 事件（阿里云官方文档要求）
+                    if event_type == "task-failed":
+                        error_code = data.get("header", {}).get("error_code", "Unknown")
+                        error_msg = data.get("header", {}).get("error_message", "Unknown error")
+                        self._task_failed = True
+                        self._task_error = f"{error_code}: {error_msg}"
+                        logger.error(f"STT task failed: {self._task_error}")
+                        # 设置 task_started 以防 send_task 还在等待
+                        self._task_started.set()
+                        # 触发重连
+                        self._reconnect_event.set()
+                        break
+                    
+                    # 处理 task-finished 事件
+                    if event_type == "task-finished":
+                        logger.info("STT task finished")
+                        break
+                    
+                    # 处理 result-generated 事件
+                    if event_type == "result-generated":
+                        self._process_stream_event(data)
+                        
                 except Exception:
                     logger.exception("failed to process message")
 
         ws: aiohttp.ClientWebSocketResponse | None = None
 
         while True:
+            # 重置任务状态（用于重连场景）
+            self._task_started.clear()
+            self._task_failed = False
+            self._task_error = None
+            
             try:
                 ws = await self._connect_ws()
                 await ws.send_json(self._opts.get_run_task_params(task_id=task_id))
+                logger.debug(f"Sent run-task, task_id={task_id}")
+                
                 tasks = [
                     asyncio.create_task(send_task(ws)),
                     asyncio.create_task(recv_task(ws)),
