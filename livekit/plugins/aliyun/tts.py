@@ -136,7 +136,6 @@ class TTSOptions:
 
         重要：task_id 由外部传入，确保整个任务生命周期使用相同的 task_id。
 
-        官方文档要求：
         - input 字段必须存在，格式为空对象 {}
         - 不要在 run-task 中发送文本
         """
@@ -171,7 +170,6 @@ class TTSOptions:
 
         重要：task_id 由外部传入，必须与 run-task 使用相同的 task_id。
 
-        官方文档要求：
         - 只能在收到 task-started 事件后发送
         - 文本提交间隔不能超过 23 秒
         """
@@ -195,7 +193,6 @@ class TTSOptions:
 
         重要：task_id 由外部传入，必须与 run-task 使用相同的 task_id。
 
-        官方文档要求：
         - 必须发送此指令，否则会导致音频不完整、连接超时、计费异常
         - input 字段必须存在，格式为空对象 {}
         """
@@ -363,7 +360,6 @@ class SynthesizeStream(tts.SynthesizeStream):
     - 使用 ConnectionPool 复用 WebSocket 连接
     - 正确处理 CancelledError
 
-    符合阿里云官方文档：
     - task_id 在整个任务生命周期保持一致
     - 正确的指令顺序：run-task → task-started → continue-task* → finish-task → task-finished
     - sentence-synthesis 与 BINARY 帧一一对应
@@ -530,7 +526,7 @@ class SynthesizeStream(tts.SynthesizeStream):
         - task-finished: 任务完成，设置 _task_finished 事件
         - task-failed: 任务失败，关闭连接并抛出异常
 
-        重要：sentence-synthesis 和 BINARY 帧一一对应（官方文档要求）
+        重要：sentence-synthesis 和 BINARY 帧一一对应
         """
         read_timeout = 10.0  # 读取超时
         expecting_binary = False  # 是否期待 BINARY 帧
@@ -591,7 +587,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                         error_code = data.get("header", {}).get("error_code", "Unknown")
                         error_msg = data.get("header", {}).get("error_message", "Unknown error")
                         logger.error(f"TTS task failed: {error_code} - {error_msg}")
-                        # 官方文档：task-failed 后连接不可复用，主动关闭
+                        # task-failed 后连接不可复用，主动关闭
                         await ws.close()
                         raise Exception(f"TTS task failed: {error_code} - {error_msg}")
 

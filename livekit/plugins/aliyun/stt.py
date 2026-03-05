@@ -45,6 +45,8 @@ class STTOptions:
     punctuation_prediction_enabled: bool = True
     # 设置是否开启文本逆归一化，默认开启。
     inverse_text_normalization_enabled: bool = True
+    # 是否开启长连接保持，默认开启。开启后在用户静默期间服务端会返回 heartbeat 消息保持连接
+    heartbeat: bool = True
 
     def get_ws_url(self):
         return "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
@@ -68,7 +70,7 @@ class STTOptions:
             "punctuation_prediction_enabled": self.punctuation_prediction_enabled,
             "inverse_text_normalization_enabled": self.inverse_text_normalization_enabled,
             "max_sentence_silence": self.max_sentence_silence,
-            "heartbeat": True,
+            "heartbeat": self.heartbeat,
             "diarization_enabled": True,
         }
         
@@ -125,6 +127,7 @@ class STT(stt.STT):
         inverse_text_normalization_enabled: bool = True,
         vocabulary_id: str | None = None,
         workspace: str | None = None,
+        heartbeat: bool = True,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
         super().__init__(
@@ -148,6 +151,7 @@ class STT(stt.STT):
             inverse_text_normalization_enabled=inverse_text_normalization_enabled,
             vocabulary_id=vocabulary_id,
             workspace=workspace,
+            heartbeat=heartbeat,
         )
 
         self._session = http_session
@@ -185,7 +189,6 @@ class SpeechStream(stt.SpeechStream):
     """
     阿里云 STT 流式识别实现。
 
-    符合阿里云官方文档要求：
     - task_id 在整个任务生命周期保持一致
     - 等待 task-started 事件后才发送音频数据
     - 正确处理 task-failed 事件
@@ -209,7 +212,7 @@ class SpeechStream(stt.SpeechStream):
         self._request_id = utils.shortuuid()
         self._reconnect_event = asyncio.Event()
         self._session = http_session
-        # 任务状态事件（符合阿里云官方文档要求）
+        # 任务状态事件
         self._task_started = asyncio.Event()
         self._task_failed = False
         self._task_error: str | None = None
@@ -232,7 +235,7 @@ class SpeechStream(stt.SpeechStream):
         async def send_task(ws: aiohttp.ClientWebSocketResponse):
             nonlocal closing_ws
             
-            # 等待 task-started 事件（阿里云官方文档要求）
+            # 等待 task-started 事件
             # "You must wait to receive this event before you send the audio"
             try:
                 await asyncio.wait_for(
@@ -280,17 +283,24 @@ class SpeechStream(stt.SpeechStream):
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse):
             nonlocal closing_ws
-            # 读取超时（Interval Timeout）：如果 10 秒内连一个数据包都没收到，认为连接假死
-            read_timeout = 10.0
+            # 根据 heartbeat 配置决定超时策略：
+            # - heartbeat=True: 服务端会返回 heartbeat 消息保持连接，不需要客户端超时
+            # - heartbeat=False: 服务端 60 秒静默后会断开，设置 70 秒超时以检测连接问题
+            read_timeout = None if self._opts.heartbeat else 70.0
+            
             while True:
                 try:
                     if ws.closed:
                         logger.warning("WebSocket connection is closed")
                         break
-                    msg = await asyncio.wait_for(ws.receive(), timeout=read_timeout)
+                    if read_timeout:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=read_timeout)
+                    else:
+                        msg = await ws.receive()
                 except asyncio.TimeoutError:
                     logger.error(
-                        "STT read timeout (connection may be dead), closing connection",
+                        "STT read timeout (connection may be dead), closing connection. "
+                        "Consider enabling heartbeat=True for long silence scenarios.",
                         extra={"timeout": read_timeout},
                     )
                     break
@@ -313,13 +323,13 @@ class SpeechStream(stt.SpeechStream):
                     data = json.loads(msg.data)
                     event_type = data.get("header", {}).get("event")
                     
-                    # 处理 task-started 事件（阿里云官方文档要求）
+                    # 处理 task-started 事件
                     if event_type == "task-started":
                         logger.info("STT task started")
                         self._task_started.set()
                         continue
                     
-                    # 处理 task-failed 事件（阿里云官方文档要求）
+                    # 处理 task-failed 事件
                     if event_type == "task-failed":
                         error_code = data.get("header", {}).get("error_code", "Unknown")
                         error_msg = data.get("header", {}).get("error_message", "Unknown error")
@@ -387,6 +397,12 @@ class SpeechStream(stt.SpeechStream):
         event_type = data["header"]["event"]
         if event_type == "result-generated":
             output = data["payload"]["output"]["sentence"]
+            
+            # 跳过 heartbeat 消息，若该值为 true，可跳过识别结果的处理
+            if output.get("heartbeat"):
+                logger.debug("Received heartbeat message, skipping")
+                return
+            
             is_sentence_end = output["sentence_end"]
             start_time = output["begin_time"]
             end_time = output["end_time"]
