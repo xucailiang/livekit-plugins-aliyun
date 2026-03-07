@@ -229,7 +229,6 @@ class SpeechStream(stt.SpeechStream):
 
     async def _run(self) -> None:
         closing_ws = False
-        task_id = utils.shortuuid()
 
         @utils.log_exceptions(logger=logger)
         async def send_task(ws: aiohttp.ClientWebSocketResponse):
@@ -357,6 +356,8 @@ class SpeechStream(stt.SpeechStream):
         ws: aiohttp.ClientWebSocketResponse | None = None
 
         while True:
+            # 每次连接/重连生成新的 task_id，阿里云要求不同任务使用不同 task_id
+            task_id = utils.shortuuid()
             # 重置任务状态（用于重连场景）
             self._task_started.clear()
             self._task_failed = False
