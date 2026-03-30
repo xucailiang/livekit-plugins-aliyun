@@ -63,7 +63,7 @@ import aiohttp
 import asyncio
 import json
 
-from livekit.agents import tts, APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS, utils
+from livekit.agents import tts, APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS, APIConnectionError, APITimeoutError, APIStatusError, utils
 
 from .log import logger
 
@@ -456,9 +456,15 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         流程：
         1. 发送 run-task
-        2. 等待 task-started 事件
+        2. 等待 task-started 事件（由 _recv_task 设置）
         3. 循环发送 continue-task（从 _input_ch 读取文本）
         4. 发送 finish-task
+        5. 等待 task-finished 事件（由 _recv_task 设置）
+
+        异常传播机制：
+        - 如果连接已死，_recv_task 会抛出 ConnectionError，asyncio.gather
+          会立即 cancel 本协程，无需依赖 send_timeout 来检测死连接。
+        - send_timeout 仅用于防御"连接活着但服务端不响应"的极端情况。
         """
         send_timeout = self._conn_options.timeout or 20.0
 
@@ -499,12 +505,26 @@ class SynthesizeStream(tts.SynthesizeStream):
             )
             logger.debug("Sent finish-task")
 
-            # 等待 task-finished 事件
-            await self._task_finished.wait()
+            # 5. 等待 task-finished 事件
+            # 使用 timeout 防御服务端不返回 task-finished 的情况。
+            # 正常情况下 _recv_task 会设置此事件；如果 _recv_task 先异常退出，
+            # gather 会 cancel 本协程，不会卡在这里。
+            await asyncio.wait_for(
+                self._task_finished.wait(),
+                timeout=send_timeout
+            )
 
         except asyncio.TimeoutError:
-            logger.error(f"TTS send timeout, task_id={task_id}")
-            raise
+            logger.error(
+                f"TTS send timeout, task_id={task_id}, "
+                f"task_started={'set' if self._task_started.is_set() else 'not set'}, "
+                f"task_finished={'set' if self._task_finished.is_set() else 'not set'}"
+            )
+            raise APITimeoutError(
+                f"TTS send timeout, task_id={task_id}, "
+                f"task_started={'set' if self._task_started.is_set() else 'not set'}, "
+                f"task_finished={'set' if self._task_finished.is_set() else 'not set'}"
+            )
         except asyncio.CancelledError:
             logger.debug("TTS send task cancelled")
             raise
@@ -526,9 +546,15 @@ class SynthesizeStream(tts.SynthesizeStream):
         - task-finished: 任务完成，设置 _task_finished 事件
         - task-failed: 任务失败，关闭连接并抛出异常
 
-        重要：sentence-synthesis 和 BINARY 帧一一对应
+        重要：
+        - sentence-synthesis 和 BINARY 帧一一对应
+        - 连接异常时必须抛出异常（而非静默退出），以便 asyncio.gather
+          立即取消 _send_task，实现快速失败
         """
-        read_timeout = 10.0  # 读取超时
+        # 阿里云 TTS 没有 heartbeat 机制（不同于 STT），所以需要 read_timeout 来检测死连接。
+        # 阿里云文档：continue-task 间隔不能超过 23 秒，所以服务端在正常流程中
+        # 一定会在 23 秒内有响应。这里用 30 秒作为安全上限。
+        read_timeout = 30.0
         expecting_binary = False  # 是否期待 BINARY 帧
         is_first_audio = True
         start_time = time.perf_counter()  # 首字延迟监控起始时间
@@ -541,8 +567,10 @@ class SynthesizeStream(tts.SynthesizeStream):
                         timeout=read_timeout
                     )
                 except asyncio.TimeoutError:
-                    logger.error("TTS read timeout (connection may be dead)")
-                    break
+                    raise APITimeoutError(
+                        f"TTS recv timeout after {read_timeout}s — "
+                        "WebSocket connection is likely dead"
+                    )
 
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
@@ -589,7 +617,11 @@ class SynthesizeStream(tts.SynthesizeStream):
                         logger.error(f"TTS task failed: {error_code} - {error_msg}")
                         # task-failed 后连接不可复用，主动关闭
                         await ws.close()
-                        raise Exception(f"TTS task failed: {error_code} - {error_msg}")
+                        raise APIStatusError(
+                            message=f"TTS task failed: {error_code} - {error_msg}",
+                            status_code=500,
+                            body=data,
+                        )
 
                 # 5.3: BINARY 帧处理
                 # 注意：某些模型/配置下，服务端可能直接发送 BINARY 帧而不先发送 sentence-synthesis
@@ -610,12 +642,18 @@ class SynthesizeStream(tts.SynthesizeStream):
                     expecting_binary = False  # 重置状态
 
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"WebSocket error: {msg.data}")
-                    break
+                    raise APIConnectionError(
+                        f"WebSocket error: {ws.exception() or msg.data}"
+                    )
 
-                elif msg.type == aiohttp.WSMsgType.CLOSE:
-                    logger.warning("WebSocket connection closed by server")
-                    break
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                ):
+                    raise APIConnectionError(
+                        "WebSocket connection closed by server"
+                    )
 
         except asyncio.CancelledError:
             logger.debug("TTS recv task cancelled")
